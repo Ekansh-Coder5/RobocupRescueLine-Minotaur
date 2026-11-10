@@ -1,0 +1,704 @@
+"""Hardware: ESP32 sensor reader, status text, OLED, servo motors, camera,
+and the basic timed / gyro-based moves."""
+import glob
+import time
+import threading
+import numpy as np
+import serial
+from scservo_sdk import PortHandler, PacketHandler
+from picamera2 import Picamera2
+from gpiozero import Button
+
+# ---- OLED imports ----
+from luma.core.interface.serial import i2c
+from luma.core.render import canvas
+from luma.oled.device import ssd1306
+
+from config import *
+
+
+# ==================== SENSOR READER ====================
+# Sensor data shared state
+distance_mm = 0.0
+distance_valid = False
+yaw = 0.0
+roll = 0.0
+pitch = 0.0
+still = mpu_ok = False
+counter = 0
+connected = False
+
+_running = False
+_thread = None
+_lock = threading.Lock()
+
+
+def _esp_ports():
+    """Ports to try, PORT_ESP first. If ESP_TRY_OTHER_USB_PORTS is on, any other
+    /dev/ttyUSB* is tried too, in case the ESP32 came back with a new name."""
+    ports = [PORT_ESP]
+    if ESP_TRY_OTHER_USB_PORTS:
+        for port in sorted(glob.glob("/dev/ttyUSB*")):
+            if port not in ports:
+                ports.append(port)
+    return ports
+
+
+def _open_esp():
+    """Try each port in turn. Returns (open Serial, None) or (None, last error)."""
+    last_error = None
+    for port in _esp_ports():
+        try:
+            return serial.Serial(port, BAUD_ESP, timeout=ESP_READ_TIMEOUT), None
+        except (serial.SerialException, OSError) as e:
+            last_error = e
+    return None, last_error
+
+
+def _store_packet(raw):
+    """Parse one line from the ESP32 and store it in the shared state.
+    Returns True if it was a valid packet, False otherwise."""
+    global distance_mm, distance_valid, yaw, roll, pitch
+    global still, mpu_ok, counter
+
+    try:
+        line = raw.decode("utf-8").strip()
+        parts = line.split()
+        if len(parts) < 2 or parts[0] != "test":
+            return False
+
+        data = {}
+        i = 2
+        while i + 1 < len(parts):
+            data[parts[i]] = parts[i + 1]
+            i += 2
+
+        new_counter = int(parts[1])
+        new_distance = float(data["distance_mm"])
+        new_distance_valid = bool(int(data["distance_valid"]))
+        new_yaw = float(data["yaw"])
+        new_still = bool(int(data["still"]))
+        new_mpu_ok = bool(int(data["mpu_ok"]))
+        # optional, so a packet without roll/pitch is still accepted
+        new_roll = float(data.get("roll", 0.0))
+        new_pitch = float(data.get("pitch", 0.0))
+
+    except (ValueError, KeyError, UnicodeDecodeError):
+        return False
+
+    with _lock:
+        counter = new_counter
+        distance_mm = new_distance
+        distance_valid = new_distance_valid
+        yaw = new_yaw
+        roll = new_roll
+        pitch = new_pitch
+        still = new_still
+        mpu_ok = new_mpu_ok
+    return True
+
+
+def _wait_while_running(seconds):
+    """Sleep for up to `seconds`, returning early if the reader is being stopped."""
+    end = time.monotonic() + seconds
+    while _running and time.monotonic() < end:
+        time.sleep(0.05)
+
+
+def _read_serial():
+    """Keep the ESP32 connection alive for as long as the reader runs.
+    The port is closed and reopened (same as rerunning the script) when:
+      - it can't be opened (e.g. not ready yet at boot),
+      - it throws an error (e.g. USB dropped),
+      - no valid packet arrives within ESP_FIRST_PACKET_TIMEOUT after opening,
+      - valid packets stop for ESP_NO_DATA_TIMEOUT."""
+    global connected
+
+    open_error_reported = False
+
+    while _running:
+        ser, error = _open_esp()
+        if ser is None:
+            # Report once per outage, not on every retry
+            if not open_error_reported:
+                print(f"ESP32 serial error: {error}. "
+                      f"Retrying every {ESP_RECONNECT_DELAY:.1f}s...")
+                open_error_reported = True
+            _wait_while_running(ESP_RECONNECT_DELAY)
+            continue
+
+        open_error_reported = False
+        print(f"ESP32 port opened: {ser.port}")
+        connected = True
+        opened_at = time.monotonic()
+        last_packet_at = None
+
+        try:
+            with ser:
+                while _running:
+                    raw = ser.readline()
+                    now = time.monotonic()
+
+                    if raw and _store_packet(raw):
+                        if last_packet_at is None:
+                            print("ESP32 data received.")
+                        last_packet_at = now
+                        continue
+
+                    # No valid packet this time: check whether the data has stopped
+                    if last_packet_at is None:
+                        if now - opened_at > ESP_FIRST_PACKET_TIMEOUT:
+                            print(f"ESP32: no data {ESP_FIRST_PACKET_TIMEOUT:.1f}s after "
+                                  f"opening {ser.port}. Reconnecting...")
+                            break
+                    elif now - last_packet_at > ESP_NO_DATA_TIMEOUT:
+                        print(f"ESP32: data stopped for {ESP_NO_DATA_TIMEOUT:.1f}s. "
+                              f"Reconnecting...")
+                        break
+
+        except (serial.SerialException, OSError) as e:
+            print(f"ESP32 serial error: {e}. Reconnecting...")
+        finally:
+            connected = False
+
+        _wait_while_running(ESP_RECONNECT_DELAY)
+
+
+def start_sensor_thread():
+    global _running, _thread
+    if _thread is not None and _thread.is_alive():
+        return
+    _running = True
+    _thread = threading.Thread(target=_read_serial, daemon=True)
+    _thread.start()
+
+
+def stop_sensor_thread():
+    global _running
+    _running = False
+
+
+def get_sensor_data():
+    with _lock:
+        return {
+            "counter": counter,
+            "distance_mm": distance_mm,
+            "distance_valid": distance_valid,
+            "yaw": yaw,
+            "roll": roll,
+            "pitch": pitch,
+            "mpu_ok": mpu_ok,
+            "connected": connected,
+        }
+
+
+# ==================== STATUS TEXT (shown on the OLED) ====================
+_status = "LFR"
+_status_lock = threading.Lock()
+
+
+def set_status(text):
+    global _status
+    with _status_lock:
+        _status = text
+
+
+def get_status():
+    with _status_lock:
+        return _status
+
+
+# ==================== OLED SAFETY DISPLAY ====================
+def get_safety_status(data):
+    # Cannot claim safety when sensors are unavailable
+    if not data["connected"]:
+        return "NO ESP32 DATA"
+
+    if not data["distance_valid"] or not data["mpu_ok"]:
+        return "SENSOR ERROR"
+
+    distance = data["distance_mm"]
+    r = data["roll"]
+    p = data["pitch"]
+
+    if distance <= DANGER_DISTANCE:
+        return "DANGER"
+    if abs(r) >= DANGER_TILT or abs(p) >= DANGER_TILT:
+        return "DANGER"
+
+    if distance <= CAUTION_DISTANCE:
+        return "CAUTION"
+    if abs(r) >= MAX_SAFE_TILT or abs(p) >= MAX_SAFE_TILT:
+        return "CAUTION"
+
+    return "SAFE"
+
+
+class SafetyDisplay:
+    """OLED runs in its own daemon thread, reading the same shared sensor state as
+    the gyro turns. It never touches the camera, motors, or line-following logic,
+    and any OLED error is caught so the robot keeps running without the display."""
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread = None
+        self._display = None
+
+    def start(self):
+        if not OLED_ENABLED:
+            return
+        # Guard against being started twice (would open a second display + thread)
+        if self._thread is not None and self._thread.is_alive():
+            return
+        try:
+            bus = i2c(port=1, address=OLED_ADDRESS)
+            self._display = ssd1306(bus, width=OLED_WIDTH, height=OLED_HEIGHT)
+        except Exception as e:
+            print(f"OLED unavailable, continuing without display: {e}")
+            self._display = None
+            return
+
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _draw(self, data):
+        status = get_safety_status(data)
+        with canvas(self._display) as draw:
+            draw.text((0, 0), get_status(), fill="white")
+            draw.line((0, 11, 127, 11), fill="white")
+
+            draw.text((0, 15), "SAFETY:", fill="white")
+            draw.text((48, 15), status, fill="white")
+            if data["distance_valid"]:
+                draw.text((0, 27), f"DIST: {data['distance_mm']:.0f} mm", fill="white")
+            else:
+                draw.text((0, 27), "DIST: INVALID", fill="white")
+
+            draw.text((0, 39), f"R:{data['roll']:.1f} P:{data['pitch']:.1f}", fill="white")
+            draw.text((0, 51), f"Y:{data['yaw']:.1f} deg", fill="white")
+
+    def _run(self):
+        errors = 0
+        while not self._stop.is_set():
+            try:
+                self._draw(get_sensor_data())
+                errors = 0
+            except Exception as e:
+                errors += 1
+                if errors == 1:
+                    print(f"OLED update error: {e}")
+                if errors >= 20:
+                    print("OLED failing repeatedly; display thread stopping.")
+                    return
+            self._stop.wait(OLED_REFRESH_SECONDS)
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        if self._display is not None:
+            try:
+                self._display.clear()
+                self._display.show()
+            except Exception:
+                pass
+
+
+# ==================== SERVO MOTORS CLASS ====================
+class ServoMotors:
+    PORT = "/dev/ttyACM0"
+    BAUDRATE = 1000000
+
+    REG_ANGLE_LIMITS = 9
+    REG_TORQUE = 40
+    REG_PWM = 44
+    REG_LOCK = 48
+
+    def __init__(self, left_ids=(1, 2), right_ids=(3, 4), reversed_ids=(3, 4)):
+        self.motor_switch = Button(SWITCH_GPIO, pull_up=True)
+        self.left_ids = list(left_ids)
+        self.right_ids = list(right_ids)
+        self.reversed_ids = set(reversed_ids)
+        self.all_ids = self.left_ids + self.right_ids
+        self.lock = threading.Lock()
+        self._warned = set()
+        self.dry_run = False
+        self.port = None
+        self.ph = None
+
+        try:
+            self.port = PortHandler(self.PORT)
+            if not self.port.openPort():
+                raise RuntimeError(f"Could not open {self.PORT}")
+            self.port.setBaudRate(self.BAUDRATE)
+            self.ph = PacketHandler(1)
+
+            for ID in self.all_ids:
+                model, comm, err = self.ph.ping(self.port, ID)
+                if comm != 0:
+                    raise RuntimeError(f"No reply from servo ID {ID}: {self.ph.getTxRxResult(comm)}")
+                print(f"Connected ID {ID}, model:", model, "| error byte:", err)
+
+            for ID in self.all_ids:
+                self._continuous_mode(ID)
+                self.ph.write1ByteTxRx(self.port, ID, self.REG_TORQUE, 1)
+
+        except Exception as e:
+            print(f"[DRY RUN] Servo board unavailable ({e}). Motors disabled; camera/preview still running.")
+            self.dry_run = True
+            if self.port is not None:
+                try:
+                    self.port.closePort()
+                except Exception:
+                    pass
+            self.port = None
+
+    def _eeprom_write(self, servo_id, reg, data):
+        if self.dry_run:
+            return
+        self.ph.write1ByteTxRx(self.port, servo_id, self.REG_LOCK, 0)
+        time.sleep(0.05)
+        self.ph.writeTxRx(self.port, servo_id, reg, len(data), data)
+        time.sleep(0.05)
+        self.ph.write1ByteTxRx(self.port, servo_id, self.REG_LOCK, 1)
+        time.sleep(0.05)
+
+    def _continuous_mode(self, servo_id):
+        self._eeprom_write(servo_id, self.REG_ANGLE_LIMITS, [0, 0, 0, 0])
+
+    def _set_speed(self, servo_id, percent):
+        if self.dry_run:
+            return
+        percent = max(-100, min(100, float(percent)))
+        if servo_id in self.reversed_ids:
+            percent = -percent
+        raw = int(abs(percent) * 10) | (0x400 if percent < 0 else 0)
+        comm, err = self.ph.write2ByteTxRx(self.port, servo_id, self.REG_PWM, raw)
+        if comm != 0:
+            print(f"ID {servo_id} WRITE FAILED: {self.ph.getTxRxResult(comm)}")
+        elif err != 0 and servo_id not in self._warned:
+            self._warned.add(servo_id)
+            print(f"ID {servo_id} status byte = {err} (bit0 = voltage error) - check power supply")
+
+    def set_motors(self, left, right):
+        with self.lock:
+            # Master switch OFF: force every motor to zero
+            if not self.motor_switch.is_pressed:
+                left = 0
+                right = 0
+
+            for ID in self.left_ids:
+                self._set_speed(ID, left)
+            for ID in self.right_ids:
+                self._set_speed(ID, right)
+
+    def stop_motors(self):
+        self.set_motors(0, 0)
+
+    def close(self):
+        self.stop_motors()
+        if self.port is not None:
+            self.port.closePort()
+        self.motor_switch.close()
+
+
+def drive(motors, left, right):
+    scale = 100.0 / 255.0
+    left = float(np.clip(left * scale, -SPEED_LIMIT_PERCENT, SPEED_LIMIT_PERCENT))
+    right = float(np.clip(right * scale, -SPEED_LIMIT_PERCENT, SPEED_LIMIT_PERCENT))
+    motors.set_motors(left, right)
+    return left, right
+
+
+# ==================== CAMERA ====================
+class Camera:
+    def __init__(self, size=FRAME_SIZE):
+        self.cam = Picamera2()
+        props = self.cam.camera_properties
+        if "PixelArraySize" in props:
+            full_w, full_h = props["PixelArraySize"]
+        else:  # newer libcamera: use the full active sensor area
+            full_w, full_h = props["PixelArrayActiveAreas"][0][2:]
+        config = self.cam.create_video_configuration(
+            main={"size": size, "format": "RGB888"},
+            transform=CAMERA_TRANSFORM,
+            controls={"ScalerCrop": (0, 0, full_w, full_h)})
+        self.cam.configure(config)
+        self.cam.start()
+        time.sleep(0.5)
+
+    def get_camera_view(self):
+        return self.cam.capture_array()
+
+    def release(self):
+        self.cam.stop()
+        self.cam.close()
+
+
+def fresh_frame(camera, flush=FLUSH_FRAMES):
+    """Grab and discard a few frames so the one returned is current (not a stale
+    buffered frame from before a pause / pivot). Returns the last good frame or None."""
+    img = None
+    for _ in range(max(1, flush)):
+        f = camera.get_camera_view()
+        if f is not None:
+            img = f
+    return img
+
+
+# ==================== TIMED MOVES ====================
+def timed_move(motors, speed, duration):
+    """Drive both sides at the same speed for duration seconds, then stop."""
+    if duration <= 0:
+        return
+    try:
+        motors.set_motors(speed, speed)
+        time.sleep(duration)
+    finally:
+        motors.stop_motors()
+
+
+def timed_motion(motors, left, right, duration, description):
+    """Execute a timed movement."""
+
+    print(description)
+
+    try:
+        motors.set_motors(left, right)
+        time.sleep(duration)
+    finally:
+        motors.stop_motors()
+
+    time.sleep(0.15)
+
+
+def timed_turn(motors, direction, duration, speed=GYRO_TURN_SPEED):
+    """Hard-coded pivot for duration seconds, used when the MPU can't be trusted.
+    Same motor signs as turn_with_gyro(): "right" = (+speed, -speed)."""
+    if duration <= 0:
+        return
+    print(f"Hard-coded {direction} turn for {duration:.2f}s")
+    if direction == "right":
+        left, right = speed, -speed
+    else:
+        left, right = -speed, speed
+    try:
+        motors.set_motors(left, right)
+        time.sleep(duration)
+    finally:
+        motors.stop_motors()
+
+
+# ==================== GYRO-BASED TURNS ====================
+def normalize_angle_diff(target, current):
+    """Calculates the shortest angular difference handling 360 wrap-arounds."""
+    diff = (target - current) % 360
+    if diff > 180:
+        diff -= 360
+    return diff
+
+
+def turn_with_gyro(motors, angle_deg, direction="right", speed=GYRO_TURN_SPEED, fallback_time=0.0):
+    """
+    Turn using gyro feedback.
+    angle_deg: target angle to turn (e.g., 70, 90, 160)
+    direction: "right" or "left"
+    fallback_time: seconds for the hard-coded turn used instead when the ESP32 is
+                   not connected, mpu_ok is False, or yaw stops changing mid-turn.
+    Returns True if the gyro reached the target, False otherwise.
+    """
+    # Safe to call every turn: it does nothing if the reader is already running,
+    # and restarts it if it had died (e.g. after a serial error).
+    start_sensor_thread()
+    print("Waiting for ESP32 gyro connection...")
+
+    # Wait for gyro connection
+    timeout_connect = time.time() + 5.0
+    while not get_sensor_data()["connected"] and time.time() < timeout_connect:
+        time.sleep(0.1)
+
+    if not get_sensor_data()["connected"]:
+        print("WARNING: Gyro not connected, using hard-coded turn")
+        timed_turn(motors, direction, fallback_time, speed)
+        return False
+
+    print("Connected to gyro! Stabilizing...")
+    time.sleep(0.5)
+
+    data = get_sensor_data()
+    if not data["mpu_ok"]:
+        print("WARNING: MPU not OK, using hard-coded turn")
+        timed_turn(motors, direction, fallback_time, speed)
+        return False
+
+    initial_yaw = data["yaw"]
+    if direction == "right":
+        target_yaw = (initial_yaw + angle_deg) % 360.0
+        motors.set_motors(speed, -speed)  # Pivot right
+    else:
+        target_yaw = (initial_yaw - angle_deg) % 360.0
+        motors.set_motors(-speed, speed)  # Pivot left
+
+    print(f"Initial Yaw: {initial_yaw:.1f}° | Target: {target_yaw:.1f}° ({direction} {angle_deg}°)")
+
+    t0 = time.time()
+    last_yaw = initial_yaw
+    last_yaw_change = t0
+    fallback_reason = None
+    reached = False
+    try:
+        while time.time() - t0 < GYRO_TIMEOUT:
+            data = get_sensor_data()
+            now = time.time()
+            current_yaw = data["yaw"]
+
+            if not data["connected"]:
+                fallback_reason = "gyro disconnected"
+                break
+            if not data["mpu_ok"]:
+                fallback_reason = "MPU not OK"
+                break
+
+            # The robot is pivoting, so yaw must keep changing. If it stays exactly
+            # the same for GYRO_FROZEN_SECONDS, the MPU has frozen.
+            if current_yaw != last_yaw:
+                last_yaw = current_yaw
+                last_yaw_change = now
+            elif now - last_yaw_change >= GYRO_FROZEN_SECONDS:
+                fallback_reason = f"yaw stuck at {current_yaw:.1f}° for {GYRO_FROZEN_SECONDS:.1f}s"
+                break
+
+            diff = normalize_angle_diff(target_yaw, current_yaw)
+
+            print(f"Current: {current_yaw:.1f}° | Remaining: {diff:.1f}°")
+
+            if abs(diff) <= GYRO_TOLERANCE:
+                print("✓ Target angle reached!")
+                reached = True
+                break
+
+            time.sleep(0.02)  # ~50Hz check
+        else:
+            print("WARNING: gyro turn timed out before reaching the target")
+    finally:
+        motors.stop_motors()
+        # The sensor thread is not stopped here. The OLED needs live
+        # data between turns, and main() stops the thread on exit.
+
+    if fallback_reason is None:
+        return reached
+
+    # The motors were already pivoting at this speed since t0, so only run the
+    # rest of the hard-coded time.
+    remaining = max(0.0, fallback_time - (time.time() - t0))
+    print(f"WARNING: {fallback_reason}, finishing with hard-coded turn")
+    timed_turn(motors, direction, remaining, speed)
+    return False
+
+
+def obstacle_gyro_turn(motors, direction, angle=None):
+    """Turn through a relative yaw angle using fresh ESP32 readings."""
+
+    if angle is None:
+        angle = OBSTACLE_LEFT_TURN_ANGLE if direction == "left" else OBSTACLE_RIGHT_TURN_ANGLE
+
+    # NOTE: set_motors(+, -) is labelled "left" here but "right" in turn_with_gyro().
+    # Test on the robot which way it physically turns and which way yaw changes,
+    # then make the labels/signs agree.
+    if direction == "left":
+        target = angle
+        left_speed = OBSTACLE_TURN_SPEED
+        right_speed = -OBSTACLE_TURN_SPEED
+
+    elif direction == "right":
+        target = -angle
+        left_speed = -OBSTACLE_TURN_SPEED
+        right_speed = OBSTACLE_TURN_SPEED
+
+    else:
+        raise ValueError("Direction must be 'left' or 'right'")
+
+    # Get the initial yaw reference.
+    data = get_sensor_data()
+
+    if not data["connected"] or not data["mpu_ok"]:
+        motors.stop_motors()
+        print("Gyro unavailable. Turn cancelled.")
+        return False
+
+    last_yaw = data["yaw"]
+    last_counter = data["counter"]
+
+    relative_yaw = 0.0
+    start_time = time.monotonic()
+    last_update_time = start_time
+
+    print(
+        f"Turning {direction}: target {target:+.0f} degrees"
+    )
+
+    try:
+        motors.set_motors(left_speed, right_speed)
+
+        while time.monotonic() - start_time < OBSTACLE_GYRO_TURN_TIMEOUT:
+            data = get_sensor_data()
+            now = time.monotonic()
+
+            # Stop if the sensor disconnects or the MPU fails.
+            if not data["connected"] or not data["mpu_ok"]:
+                print("\nGyro unavailable during turn.")
+                return False
+
+            # Process each ESP32 packet only once.
+            if data["counter"] == last_counter:
+                if now - last_update_time > SENSOR_STALE_SECONDS:
+                    print("\nGyro readings stopped updating.")
+                    return False
+
+                time.sleep(0.005)
+                continue
+
+            last_counter = data["counter"]
+            last_update_time = now
+
+            yaw = data["yaw"]
+
+            # Calculate change since the previous yaw reading.
+            delta = yaw - last_yaw
+
+            # Correct for yaw wrapping at +/-180 degrees.
+            if delta > 180:
+                delta -= 360
+            elif delta < -180:
+                delta += 360
+
+            relative_yaw += delta
+            last_yaw = yaw
+
+            print(
+                f"\rRelative yaw: {relative_yaw:+.1f}°",
+                end="",
+                flush=True
+            )
+
+            # LEFT produces positive yaw.
+            if direction == "left" and relative_yaw >= target:
+                print("\nLeft turn complete.")
+                return True
+
+            # RIGHT produces negative yaw.
+            if direction == "right" and relative_yaw <= target:
+                print("\nRight turn complete.")
+                return True
+
+            time.sleep(0.005)
+
+        print(
+            f"\nTurn timed out at {relative_yaw:+.1f}°. "
+            f"Target was {target:+.1f}°."
+        )
+        return False
+
+    finally:
+        motors.stop_motors()
+        time.sleep(0.15)
